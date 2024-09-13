@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Last.fm Heatmap</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+        .form-container {
+            margin: 50px;
+        }
+        .heatmap-container {
+            margin: 50px;
+        }
+    </style>
+    <!-- Include Plotly.js -->
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+</head>
+<body>
+    <div class="form-container">
+        <h1>Generate Last.fm Heatmap</h1>
+        <form method="post">
+            <label for="username">Last.fm Username:</label>
+            <input type="text" id="username" name="username" required>
+            <br><br>
+            <label for="palette">Color Palette:</label>
+            <select id="palette" name="palette">
+                <option value="Viridis">Viridis</option>
+                <option value="Cividis">Cividis</option>
+                <option value="Plasma">Plasma</option>
+                <option value="Magma">Magma</option>
+                <option value="Inferno">Inferno</option>
+                <option value="Turbo">Turbo</option>
+            </select>
+            <br><br>
+            <input type="submit" value="Generate Heatmap">
+        </form>
+    </div>
+
+    {% if plot_div %}
+        <div class="heatmap-container">
+            {{ plot_div | safe }}
+        </div>
+    {% endif %}
+</body>
+</html>
