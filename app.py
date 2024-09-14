@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, render_template, session, redirect, url_for
+from flask import Flask, request, render_template
 import asyncio
 import pandas as pd
 import aiohttp
@@ -9,9 +9,6 @@ from dotenv import load_dotenv
 import plotly.graph_objs as go
 from plotly.offline import plot
 import logging
-import itertools
-import uuid
-from celery import Celery
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +21,6 @@ nest_asyncio.apply()
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'your_secret_key')  # Replace with your secret key
 
 # Retrieve the Last.fm API key from environment variables
 API_KEY = os.getenv('LASTFM_API_KEY')
@@ -33,19 +29,29 @@ API_KEY = os.getenv('LASTFM_API_KEY')
 if not API_KEY:
     raise ValueError("LASTFM_API_KEY is not set in environment variables.")
 
-# Initialize Celery
-CELERY_BROKER_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-
-celery = Celery(app.name, broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
-celery.conf.update(app.config)
+# Define the maximum number of pages to fetch to prevent excessive API calls
+MAX_PAGES = 10
 
 async def fetch_page(session, url, params, page):
     """
     Fetch a single page of recent tracks from the Last.fm API.
+
+    Args:
+        session (aiohttp.ClientSession): The aiohttp session for making requests.
+        url (str): The API endpoint URL.
+        params (dict): The query parameters for the API request.
+        page (int): The page number to fetch.
+
+    Returns:
+        dict or None: The JSON response from the API if successful, else None.
     """
+    # Update the page number in the parameters
     params['page'] = page
+
+    # Remove any parameters with None values to prevent errors
     clean_params = {k: v for k, v in params.items() if v is not None}
+
+    # Log the parameters being used for debugging
     logger.info(f"Fetching page {page} with params: {clean_params}")
 
     try:
@@ -54,6 +60,7 @@ async def fetch_page(session, url, params, page):
                 data = await response.json()
                 return data
             elif response.status == 429:
+                # Handle rate limiting by waiting and retrying
                 retry_after = int(response.headers.get('Retry-After', 5))
                 logger.warning(f"Rate limited. Retrying after {retry_after} seconds.")
                 await asyncio.sleep(retry_after)
@@ -71,9 +78,16 @@ async def fetch_page(session, url, params, page):
         logger.error(f"Unexpected error fetching page {page}: {e}")
         return None
 
-async def fetch_all_pages_async(username):
+async def fetch_all_pages(username, max_pages=MAX_PAGES):
     """
-    Fetch all pages of recent tracks from the Last.fm API asynchronously.
+    Fetch multiple pages of recent tracks from the Last.fm API.
+
+    Args:
+        username (str): The Last.fm username.
+        max_pages (int): The maximum number of pages to fetch.
+
+    Returns:
+        list: A list of all fetched tracks.
     """
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
@@ -100,6 +114,8 @@ async def fetch_all_pages_async(username):
             logger.error(f"Error parsing total pages: {e}")
             return []
 
+        # Limit the total pages to max_pages to prevent excessive fetching
+        total_pages = min(total_pages, max_pages)
         logger.info(f"Total pages to fetch: {total_pages}")
 
         # Extract tracks from the first page
@@ -114,11 +130,14 @@ async def fetch_all_pages_async(username):
                 if tracks:
                     all_tracks.extend(tracks)
                 else:
+                    # No more tracks available
                     logger.info(f"No tracks found on page {page}. Stopping fetch.")
                     break
             else:
+                # If fetching a page fails, stop fetching further pages
                 logger.error(f"Failed to fetch page {page}. Stopping fetch.")
                 break
+            # Optional: Add a short delay to respect API rate limits
             await asyncio.sleep(0.2)  # 200ms delay
 
     return all_tracks
@@ -126,6 +145,12 @@ async def fetch_all_pages_async(username):
 def process_scrobble_data(all_tracks):
     """
     Process the fetched tracks to calculate daily listening counts.
+
+    Args:
+        all_tracks (list): A list of track dictionaries fetched from the API.
+
+    Returns:
+        pandas.DataFrame: A DataFrame with dates and corresponding track counts.
     """
     scrobbles = []
     for track in all_tracks:
@@ -137,165 +162,91 @@ def process_scrobble_data(all_tracks):
             scrobbles.append(datetime.fromtimestamp(int(scrobble_time)))
 
     if not scrobbles:
-        return pd.DataFrame(columns=['month', 'day', 'count'])
+        return pd.DataFrame(columns=['date', 'count'])
 
+    # Create a DataFrame for daily counts
     df = pd.DataFrame(scrobbles, columns=['datetime'])
-    df['month'] = df['datetime'].dt.to_period('M').astype(str)
-    df['day'] = df['datetime'].dt.day
+    df['date'] = df['datetime'].dt.date
+    daily_counts = df.groupby('date').size().reset_index(name='count')
 
-    # Group by month and day to get counts
-    daily_counts = df.groupby(['month', 'day']).size().reset_index(name='count')
+    return daily_counts
 
-    # Generate all combinations of months and days
-    first_month = df['datetime'].dt.to_period('M').min()
-    last_month = df['datetime'].dt.to_period('M').max()
-    months = pd.period_range(start=first_month, end=last_month, freq='M').astype(str)
-    days = range(1, 32)
-
-    all_months_days = pd.DataFrame(list(itertools.product(months, days)), columns=['month', 'day'])
-    all_months_days['day'] = all_months_days['day'].astype(int)
-
-    # Add 'month_period' column
-    all_months_days['month_period'] = pd.PeriodIndex(all_months_days['month'], freq='M')
-
-    # Get number of days in each month
-    all_months_days['days_in_month'] = all_months_days['month_period'].dt.days_in_month
-
-    # Flag valid days
-    all_months_days['valid_day'] = all_months_days['day'] <= all_months_days['days_in_month']
-
-    # Merge counts
-    merged_counts = pd.merge(all_months_days, daily_counts, how='left', on=['month', 'day'])
-
-    # Set counts to None for invalid days
-    merged_counts['count'] = merged_counts.apply(
-        lambda row: row['count'] if row['valid_day'] else None, axis=1
-    )
-
-    return merged_counts
-
-def create_heatmap(merged_counts, palette):
+def create_heatmap(daily_counts, palette):
     """
-    Create a 2D heatmap using Plotly based on daily listening counts.
+    Create a heatmap using Plotly based on daily listening counts.
+
+    Args:
+        daily_counts (pandas.DataFrame): DataFrame with dates and track counts.
+        palette (str): The color palette for the heatmap.
+
+    Returns:
+        str: The HTML div string for the Plotly heatmap.
     """
-    if merged_counts.empty:
+    if daily_counts.empty:
         return "<p>No data available to display the heatmap.</p>"
 
-    # Pivot the data to create a matrix suitable for a heatmap
-    heatmap_data = merged_counts.pivot(index='day', columns='month', values='count')
-
-    # Sort the months chronologically
-    heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns, key=lambda x: pd.Period(x, freq='M')), axis=1)
+    # Create a continuous color scale based on the selected palette
+    colorscale = palette
 
     # Create the heatmap figure
     fig = go.Figure(data=go.Heatmap(
-        z=heatmap_data.values,
-        x=heatmap_data.columns,
-        y=heatmap_data.index,
-        colorscale=palette,
-        showscale=True,
-        hoverongaps=False  # Show gaps for invalid days
+        z=daily_counts['count'],
+        x=daily_counts['date'],
+        y=[''] * len(daily_counts),  # Single row for dates
+        colorscale=colorscale,
+        showscale=True
     ))
 
     # Update the layout for better visualization
     fig.update_layout(
-        title='Monthly Music Listening Heatmap',
-        xaxis_title='Month',
-        yaxis_title='Day of Month',
-        yaxis_autorange='reversed',  # So that day 1 is at the top
-        height=600
+        title='Daily Music Listening Heatmap',
+        xaxis_title='Date',
+        yaxis_visible=False,
+        height=400
     )
 
     # Generate the HTML div string for embedding in the template
     return plot(fig, output_type='div')
 
-@celery.task(bind=True)
-def fetch_and_process_data(self, username, palette):
-    """
-    Background task to fetch and process user data.
-    """
-    try:
-        # Fetch all tracks
-        loop = asyncio.get_event_loop()
-        all_tracks = loop.run_until_complete(fetch_all_pages_async(username))
-        if not all_tracks:
-            return {'error': 'No tracks found or API error.'}
-
-        # Process the fetched data
-        merged_counts = process_scrobble_data(all_tracks)
-        if merged_counts.empty:
-            return {'error': 'No scrobbles available to generate a heatmap.'}
-
-        # Create the heatmap HTML div
-        plot_div = create_heatmap(merged_counts, palette)
-
-        # Return the result
-        return {'plot_div': plot_div}
-    except Exception as e:
-        logger.error(f"Error in background task: {e}")
-        return {'error': f'An unexpected error occurred: {e}'}
-
 @app.route('/', methods=['GET', 'POST'])
-def index():
+async def index():
     """
-    The main route for the application.
+    The main route for the application. Handles both GET and POST requests.
+
+    GET: Renders the main page with the input form.
+    POST: Processes the submitted username, fetches data, generates the heatmap, and renders the result.
     """
+    plot_div = None
+    error = None
     if request.method == 'POST':
         username = request.form.get('username')
         palette = request.form.get('palette', 'Viridis')  # Default palette is 'Viridis'
 
         if not username:
             error = "Username is required."
-            return render_template('index.html', error=error)
+            return render_template('index.html', plot_div=plot_div, error=error)
 
-        # Generate a unique task ID
-        task_id = str(uuid.uuid4())
-        session['task_id'] = task_id
+        try:
+            # Fetch recent tracks with a limit on the number of pages
+            all_tracks = await fetch_all_pages(username, max_pages=MAX_PAGES)
+            if not all_tracks:
+                error = "No tracks found or API error."
+                return render_template('index.html', plot_div=plot_div, error=error)
 
-        # Enqueue the background task
-        task = fetch_and_process_data.apply_async(args=[username, palette], task_id=task_id)
+            # Process the fetched data to get daily counts
+            daily_counts = process_scrobble_data(all_tracks)
+            if daily_counts.empty:
+                error = "No scrobbles available to generate a heatmap."
+                return render_template('index.html', plot_div=plot_div, error=error)
 
-        # Redirect to a status page
-        return redirect(url_for('status'))
+            # Create the heatmap HTML div
+            plot_div = create_heatmap(daily_counts, palette)
+        except Exception as e:
+            error = f"An unexpected error occurred: {e}"
+            logger.error(f"Error in index route: {e}")
 
-    return render_template('index.html')
-
-@app.route('/status', methods=['GET'])
-def status():
-    """
-    Route to check the status of the background task.
-    """
-    task_id = session.get('task_id')
-    if not task_id:
-        return redirect(url_for('index'))
-
-    task = fetch_and_process_data.AsyncResult(task_id)
-
-    if task.state == 'PENDING':
-        # Task is still running
-        status = 'Processing...'
-        return render_template('status.html', status=status)
-
-    elif task.state == 'SUCCESS':
-        result = task.get()
-        if 'error' in result:
-            error = result['error']
-            return render_template('index.html', error=error)
-        else:
-            plot_div = result['plot_div']
-            # Clear the session task_id
-            session.pop('task_id', None)
-            return render_template('result.html', plot_div=plot_div)
-
-    elif task.state == 'FAILURE':
-        error = 'An error occurred during processing.'
-        return render_template('index.html', error=error)
-
-    else:
-        # Other states
-        status = 'Processing...'
-        return render_template('status.html', status=status)
+    return render_template('index.html', plot_div=plot_div, error=error)
 
 if __name__ == '__main__':
-    # Run the Flask app
+    # Run the Flask app in debug mode for local development
     app.run(debug=True)
