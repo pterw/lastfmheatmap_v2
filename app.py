@@ -15,7 +15,7 @@ nest_asyncio.apply()
 
 app = Flask(__name__)
 
-API_KEY = os.getenv('47a3bb30787578c70e3bf827e0281936')
+API_KEY = os.getenv('LASTFM_API_KEY')
 
 async def fetch_page(session, url, params, page):
     params['page'] = page
@@ -31,8 +31,8 @@ async def fetch_all_pages(username):
     url = 'http://ws.audioscrobbler.com/2.0/'
     params = {
         'method': 'user.getRecentTracks',
-        'flounder14': username,
-        '47a3bb30787578c70e3bf827e0281936': API_KEY,
+        'user': username,
+        'api_key': API_KEY,
         'format': 'json',
         'limit': 200,
     }
@@ -170,3 +170,4 @@ async def index():
 
 if __name__ == '__main__':
     app.run()
+
