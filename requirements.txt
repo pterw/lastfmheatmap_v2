@@ -1,6 +1,6 @@
 aiohttp==3.8.1
 asyncio==3.4.3
-Flask==2.2.5   # Update to the latest stable version of Flask
+Flask[async]==2.2.5   # Update to the latest stable version of Flask
 gunicorn==20.1.0
 nest-asyncio==1.5.1
 pandas==1.3.2
