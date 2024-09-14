@@ -8,6 +8,11 @@ import nest_asyncio
 from dotenv import load_dotenv
 import plotly.graph_objs as go
 from plotly.offline import plot
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Apply nest_asyncio to allow nested event loops (useful for certain environments)
 nest_asyncio.apply()
@@ -47,7 +52,7 @@ async def fetch_page(session, url, params, page):
     clean_params = {k: v for k, v in params.items() if v is not None}
 
     # Log the parameters being used for debugging
-    print(f"Fetching page {page} with params: {clean_params}")
+    logger.info(f"Fetching page {page} with params: {clean_params}")
 
     try:
         async with session.get(url, params=clean_params, timeout=10) as response:
@@ -56,21 +61,21 @@ async def fetch_page(session, url, params, page):
                 return data
             elif response.status == 429:
                 # Handle rate limiting by waiting and retrying
-                retry_after = int(response.headers.get('Retry-After', 1))
-                print(f"Rate limited. Retrying after {retry_after} seconds.")
+                retry_after = int(response.headers.get('Retry-After', 5))
+                logger.warning(f"Rate limited. Retrying after {retry_after} seconds.")
                 await asyncio.sleep(retry_after)
                 return await fetch_page(session, url, params, page)
             else:
-                print(f"Error fetching page {page}: HTTP {response.status}")
+                logger.error(f"Error fetching page {page}: HTTP {response.status}")
                 return None
     except aiohttp.ClientError as e:
-        print(f"Client error fetching page {page}: {e}")
+        logger.error(f"Client error fetching page {page}: {e}")
         return None
     except asyncio.TimeoutError:
-        print(f"Timeout error fetching page {page}.")
+        logger.error(f"Timeout error fetching page {page}.")
         return None
     except Exception as e:
-        print(f"Unexpected error fetching page {page}: {e}")
+        logger.error(f"Unexpected error fetching page {page}: {e}")
         return None
 
 async def fetch_all_pages(username, max_pages=MAX_PAGES):
@@ -101,13 +106,21 @@ async def fetch_all_pages(username, max_pages=MAX_PAGES):
             return []
 
         # Extract total number of pages from the response
-        total_pages = int(first_page_data.get('recenttracks', {}).get('@attr', {}).get('totalPages', 1))
+        try:
+            recent_tracks = first_page_data['recenttracks']
+            attr = recent_tracks.get('@attr', {})
+            total_pages = int(attr.get('totalPages', 1))
+        except (KeyError, ValueError) as e:
+            logger.error(f"Error parsing total pages: {e}")
+            return []
+
         # Limit the total pages to max_pages to prevent excessive fetching
         total_pages = min(total_pages, max_pages)
-        print(f"Total pages to fetch: {total_pages}")
+        logger.info(f"Total pages to fetch: {total_pages}")
 
         # Extract tracks from the first page
-        all_tracks.extend(first_page_data.get('recenttracks', {}).get('track', []))
+        tracks = recent_tracks.get('track', [])
+        all_tracks.extend(tracks)
 
         # Sequentially fetch remaining pages
         for page in range(2, total_pages + 1):
@@ -118,11 +131,11 @@ async def fetch_all_pages(username, max_pages=MAX_PAGES):
                     all_tracks.extend(tracks)
                 else:
                     # No more tracks available
-                    print(f"No tracks found on page {page}. Stopping fetch.")
+                    logger.info(f"No tracks found on page {page}. Stopping fetch.")
                     break
             else:
                 # If fetching a page fails, stop fetching further pages
-                print(f"Failed to fetch page {page}. Stopping fetch.")
+                logger.error(f"Failed to fetch page {page}. Stopping fetch.")
                 break
             # Optional: Add a short delay to respect API rate limits
             await asyncio.sleep(0.2)  # 200ms delay
@@ -230,7 +243,7 @@ async def index():
             plot_div = create_heatmap(daily_counts, palette)
         except Exception as e:
             error = f"An unexpected error occurred: {e}"
-            print(f"Error in index route: {e}")
+            logger.error(f"Error in index route: {e}")
 
     return render_template('index.html', plot_div=plot_div, error=error)
 
