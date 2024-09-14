@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import plotly.graph_objs as go
 from plotly.offline import plot
 import logging
+import itertools  # Import itertools for creating combinations
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,29 +30,12 @@ API_KEY = os.getenv('LASTFM_API_KEY')
 if not API_KEY:
     raise ValueError("LASTFM_API_KEY is not set in environment variables.")
 
-# Define the maximum number of pages to fetch to prevent excessive API calls
-MAX_PAGES = 10
-
 async def fetch_page(session, url, params, page):
     """
     Fetch a single page of recent tracks from the Last.fm API.
-
-    Args:
-        session (aiohttp.ClientSession): The aiohttp session for making requests.
-        url (str): The API endpoint URL.
-        params (dict): The query parameters for the API request.
-        page (int): The page number to fetch.
-
-    Returns:
-        dict or None: The JSON response from the API if successful, else None.
     """
-    # Update the page number in the parameters
     params['page'] = page
-
-    # Remove any parameters with None values to prevent errors
     clean_params = {k: v for k, v in params.items() if v is not None}
-
-    # Log the parameters being used for debugging
     logger.info(f"Fetching page {page} with params: {clean_params}")
 
     try:
@@ -60,7 +44,6 @@ async def fetch_page(session, url, params, page):
                 data = await response.json()
                 return data
             elif response.status == 429:
-                # Handle rate limiting by waiting and retrying
                 retry_after = int(response.headers.get('Retry-After', 5))
                 logger.warning(f"Rate limited. Retrying after {retry_after} seconds.")
                 await asyncio.sleep(retry_after)
@@ -78,16 +61,9 @@ async def fetch_page(session, url, params, page):
         logger.error(f"Unexpected error fetching page {page}: {e}")
         return None
 
-async def fetch_all_pages(username, max_pages=MAX_PAGES):
+async def fetch_all_pages(username):
     """
-    Fetch multiple pages of recent tracks from the Last.fm API.
-
-    Args:
-        username (str): The Last.fm username.
-        max_pages (int): The maximum number of pages to fetch.
-
-    Returns:
-        list: A list of all fetched tracks.
+    Fetch all pages of recent tracks from the Last.fm API.
     """
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
@@ -114,8 +90,6 @@ async def fetch_all_pages(username, max_pages=MAX_PAGES):
             logger.error(f"Error parsing total pages: {e}")
             return []
 
-        # Limit the total pages to max_pages to prevent excessive fetching
-        total_pages = min(total_pages, max_pages)
         logger.info(f"Total pages to fetch: {total_pages}")
 
         # Extract tracks from the first page
@@ -130,14 +104,11 @@ async def fetch_all_pages(username, max_pages=MAX_PAGES):
                 if tracks:
                     all_tracks.extend(tracks)
                 else:
-                    # No more tracks available
                     logger.info(f"No tracks found on page {page}. Stopping fetch.")
                     break
             else:
-                # If fetching a page fails, stop fetching further pages
                 logger.error(f"Failed to fetch page {page}. Stopping fetch.")
                 break
-            # Optional: Add a short delay to respect API rate limits
             await asyncio.sleep(0.2)  # 200ms delay
 
     return all_tracks
@@ -145,12 +116,6 @@ async def fetch_all_pages(username, max_pages=MAX_PAGES):
 def process_scrobble_data(all_tracks):
     """
     Process the fetched tracks to calculate daily listening counts.
-
-    Args:
-        all_tracks (list): A list of track dictionaries fetched from the API.
-
-    Returns:
-        pandas.DataFrame: A DataFrame with dates and corresponding track counts.
     """
     scrobbles = []
     for track in all_tracks:
@@ -162,47 +127,73 @@ def process_scrobble_data(all_tracks):
             scrobbles.append(datetime.fromtimestamp(int(scrobble_time)))
 
     if not scrobbles:
-        return pd.DataFrame(columns=['date', 'count'])
+        return pd.DataFrame(columns=['month', 'day', 'count'])
 
-    # Create a DataFrame for daily counts
     df = pd.DataFrame(scrobbles, columns=['datetime'])
-    df['date'] = df['datetime'].dt.date
-    daily_counts = df.groupby('date').size().reset_index(name='count')
+    df['month'] = df['datetime'].dt.to_period('M').astype(str)
+    df['day'] = df['datetime'].dt.day
 
-    return daily_counts
+    # Group by month and day to get counts
+    daily_counts = df.groupby(['month', 'day']).size().reset_index(name='count')
 
-def create_heatmap(daily_counts, palette):
+    # Generate all combinations of months and days
+    first_month = df['datetime'].dt.to_period('M').min()
+    last_month = df['datetime'].dt.to_period('M').max()
+    months = pd.period_range(start=first_month, end=last_month, freq='M').astype(str)
+    days = range(1, 32)
+
+    all_months_days = pd.DataFrame(list(itertools.product(months, days)), columns=['month', 'day'])
+    all_months_days['day'] = all_months_days['day'].astype(int)
+
+    # Add 'month_period' column
+    all_months_days['month_period'] = pd.PeriodIndex(all_months_days['month'], freq='M')
+
+    # Get number of days in each month
+    all_months_days['days_in_month'] = all_months_days['month_period'].dt.days_in_month
+
+    # Flag valid days
+    all_months_days['valid_day'] = all_months_days['day'] <= all_months_days['days_in_month']
+
+    # Merge counts
+    merged_counts = pd.merge(all_months_days, daily_counts, how='left', on=['month', 'day'])
+
+    # Set counts to None for invalid days
+    merged_counts['count'] = merged_counts.apply(
+        lambda row: row['count'] if row['valid_day'] else None, axis=1
+    )
+
+    return merged_counts
+
+def create_heatmap(merged_counts, palette):
     """
-    Create a heatmap using Plotly based on daily listening counts.
-
-    Args:
-        daily_counts (pandas.DataFrame): DataFrame with dates and track counts.
-        palette (str): The color palette for the heatmap.
-
-    Returns:
-        str: The HTML div string for the Plotly heatmap.
+    Create a 2D heatmap using Plotly based on daily listening counts.
     """
-    if daily_counts.empty:
+    if merged_counts.empty:
         return "<p>No data available to display the heatmap.</p>"
 
-    # Create a continuous color scale based on the selected palette
-    colorscale = palette
+    # Pivot the data to create a matrix suitable for a heatmap
+    heatmap_data = merged_counts.pivot(index='day', columns='month', values='count')
+
+    # Sort the months chronologically
+    heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns, key=lambda x: pd.Period(x, freq='M')), axis=1)
 
     # Create the heatmap figure
     fig = go.Figure(data=go.Heatmap(
-        z=daily_counts['count'],
-        x=daily_counts['date'],
-        y=[''] * len(daily_counts),  # Single row for dates
-        colorscale=colorscale,
-        showscale=True
+        z=heatmap_data.values,
+        x=heatmap_data.columns,
+        y=heatmap_data.index,
+        colorscale=palette,
+        showscale=True,
+        hoverongaps=False  # Show gaps for invalid days
     ))
 
     # Update the layout for better visualization
     fig.update_layout(
-        title='Daily Music Listening Heatmap',
-        xaxis_title='Date',
-        yaxis_visible=False,
-        height=400
+        title='Monthly Music Listening Heatmap',
+        xaxis_title='Month',
+        yaxis_title='Day of Month',
+        yaxis_autorange='reversed',  # So that day 1 is at the top
+        height=600
     )
 
     # Generate the HTML div string for embedding in the template
@@ -211,10 +202,7 @@ def create_heatmap(daily_counts, palette):
 @app.route('/', methods=['GET', 'POST'])
 async def index():
     """
-    The main route for the application. Handles both GET and POST requests.
-
-    GET: Renders the main page with the input form.
-    POST: Processes the submitted username, fetches data, generates the heatmap, and renders the result.
+    The main route for the application.
     """
     plot_div = None
     error = None
@@ -227,20 +215,20 @@ async def index():
             return render_template('index.html', plot_div=plot_div, error=error)
 
         try:
-            # Fetch recent tracks with a limit on the number of pages
-            all_tracks = await fetch_all_pages(username, max_pages=MAX_PAGES)
+            # Fetch all tracks from the user's listening history
+            all_tracks = await fetch_all_pages(username)
             if not all_tracks:
                 error = "No tracks found or API error."
                 return render_template('index.html', plot_div=plot_div, error=error)
 
             # Process the fetched data to get daily counts
-            daily_counts = process_scrobble_data(all_tracks)
-            if daily_counts.empty:
+            merged_counts = process_scrobble_data(all_tracks)
+            if merged_counts.empty:
                 error = "No scrobbles available to generate a heatmap."
                 return render_template('index.html', plot_div=plot_div, error=error)
 
             # Create the heatmap HTML div
-            plot_div = create_heatmap(daily_counts, palette)
+            plot_div = create_heatmap(merged_counts, palette)
         except Exception as e:
             error = f"An unexpected error occurred: {e}"
             logger.error(f"Error in index route: {e}")
@@ -248,5 +236,5 @@ async def index():
     return render_template('index.html', plot_div=plot_div, error=error)
 
 if __name__ == '__main__':
-    # Run the Flask app in debug mode for local development
+    # Run the Flask app
     app.run(debug=True)
