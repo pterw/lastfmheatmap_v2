@@ -1,44 +1,47 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Last.fm Heatmap</title>
+    <meta charset="UTF-8">
+    <title>Last.fm Listening Heatmap</title>
     <style>
         body {
             font-family: Arial, sans-serif;
+            margin: 40px;
         }
-        .form-container {
-            margin: 50px;
+        .error {
+            color: red;
         }
-        .heatmap-container {
-            margin: 50px;
+        .form-group {
+            margin-bottom: 15px;
         }
     </style>
-    <!-- Include Plotly.js -->
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
 <body>
-    <div class="form-container">
-        <h1>Generate Last.fm Heatmap</h1>
-        <form method="post">
+    <h1>Last.fm Listening Heatmap</h1>
+    <form method="POST">
+        <div class="form-group">
             <label for="username">Last.fm Username:</label>
             <input type="text" id="username" name="username" required>
-            <br><br>
+        </div>
+        <div class="form-group">
             <label for="palette">Color Palette:</label>
             <select id="palette" name="palette">
                 <option value="Viridis">Viridis</option>
-                <option value="Cividis">Cividis</option>
                 <option value="Plasma">Plasma</option>
-                <option value="Magma">Magma</option>
                 <option value="Inferno">Inferno</option>
-                <option value="Turbo">Turbo</option>
+                <option value="Magma">Magma</option>
+                <option value="Cividis">Cividis</option>
             </select>
-            <br><br>
-            <input type="submit" value="Generate Heatmap">
-        </form>
-    </div>
+        </div>
+        <button type="submit">Generate Heatmap</button>
+    </form>
+
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% endif %}
 
     {% if plot_div %}
-        <div class="heatmap-container">
+        <div>
             {{ plot_div | safe }}
         </div>
     {% endif %}
