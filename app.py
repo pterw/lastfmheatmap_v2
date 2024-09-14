@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, session, redirect, url_for
 import asyncio
 import pandas as pd
 import aiohttp
@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 import plotly.graph_objs as go
 from plotly.offline import plot
 import logging
-import itertools  # Import itertools for creating combinations
+import itertools
+import uuid
+from celery import Celery
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +24,7 @@ nest_asyncio.apply()
 load_dotenv()
 
 app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'your_secret_key')  # Replace with your secret key
 
 # Retrieve the Last.fm API key from environment variables
 API_KEY = os.getenv('LASTFM_API_KEY')
@@ -29,6 +32,13 @@ API_KEY = os.getenv('LASTFM_API_KEY')
 # Ensure the API key is set
 if not API_KEY:
     raise ValueError("LASTFM_API_KEY is not set in environment variables.")
+
+# Initialize Celery
+CELERY_BROKER_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+
+celery = Celery(app.name, broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
+celery.conf.update(app.config)
 
 async def fetch_page(session, url, params, page):
     """
@@ -61,9 +71,9 @@ async def fetch_page(session, url, params, page):
         logger.error(f"Unexpected error fetching page {page}: {e}")
         return None
 
-async def fetch_all_pages(username):
+async def fetch_all_pages_async(username):
     """
-    Fetch all pages of recent tracks from the Last.fm API.
+    Fetch all pages of recent tracks from the Last.fm API asynchronously.
     """
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
@@ -199,41 +209,92 @@ def create_heatmap(merged_counts, palette):
     # Generate the HTML div string for embedding in the template
     return plot(fig, output_type='div')
 
+@celery.task(bind=True)
+def fetch_and_process_data(self, username, palette):
+    """
+    Background task to fetch and process user data.
+    """
+    try:
+        # Fetch all tracks
+        loop = asyncio.get_event_loop()
+        all_tracks = loop.run_until_complete(fetch_all_pages_async(username))
+        if not all_tracks:
+            return {'error': 'No tracks found or API error.'}
+
+        # Process the fetched data
+        merged_counts = process_scrobble_data(all_tracks)
+        if merged_counts.empty:
+            return {'error': 'No scrobbles available to generate a heatmap.'}
+
+        # Create the heatmap HTML div
+        plot_div = create_heatmap(merged_counts, palette)
+
+        # Return the result
+        return {'plot_div': plot_div}
+    except Exception as e:
+        logger.error(f"Error in background task: {e}")
+        return {'error': f'An unexpected error occurred: {e}'}
+
 @app.route('/', methods=['GET', 'POST'])
-async def index():
+def index():
     """
     The main route for the application.
     """
-    plot_div = None
-    error = None
     if request.method == 'POST':
         username = request.form.get('username')
         palette = request.form.get('palette', 'Viridis')  # Default palette is 'Viridis'
 
         if not username:
             error = "Username is required."
-            return render_template('index.html', plot_div=plot_div, error=error)
+            return render_template('index.html', error=error)
 
-        try:
-            # Fetch all tracks from the user's listening history
-            all_tracks = await fetch_all_pages(username)
-            if not all_tracks:
-                error = "No tracks found or API error."
-                return render_template('index.html', plot_div=plot_div, error=error)
+        # Generate a unique task ID
+        task_id = str(uuid.uuid4())
+        session['task_id'] = task_id
 
-            # Process the fetched data to get daily counts
-            merged_counts = process_scrobble_data(all_tracks)
-            if merged_counts.empty:
-                error = "No scrobbles available to generate a heatmap."
-                return render_template('index.html', plot_div=plot_div, error=error)
+        # Enqueue the background task
+        task = fetch_and_process_data.apply_async(args=[username, palette], task_id=task_id)
 
-            # Create the heatmap HTML div
-            plot_div = create_heatmap(merged_counts, palette)
-        except Exception as e:
-            error = f"An unexpected error occurred: {e}"
-            logger.error(f"Error in index route: {e}")
+        # Redirect to a status page
+        return redirect(url_for('status'))
 
-    return render_template('index.html', plot_div=plot_div, error=error)
+    return render_template('index.html')
+
+@app.route('/status', methods=['GET'])
+def status():
+    """
+    Route to check the status of the background task.
+    """
+    task_id = session.get('task_id')
+    if not task_id:
+        return redirect(url_for('index'))
+
+    task = fetch_and_process_data.AsyncResult(task_id)
+
+    if task.state == 'PENDING':
+        # Task is still running
+        status = 'Processing...'
+        return render_template('status.html', status=status)
+
+    elif task.state == 'SUCCESS':
+        result = task.get()
+        if 'error' in result:
+            error = result['error']
+            return render_template('index.html', error=error)
+        else:
+            plot_div = result['plot_div']
+            # Clear the session task_id
+            session.pop('task_id', None)
+            return render_template('result.html', plot_div=plot_div)
+
+    elif task.state == 'FAILURE':
+        error = 'An error occurred during processing.'
+        return render_template('index.html', error=error)
+
+    else:
+        # Other states
+        status = 'Processing...'
+        return render_template('status.html', status=status)
 
 if __name__ == '__main__':
     # Run the Flask app
