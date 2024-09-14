@@ -1,103 +1,128 @@
 import os
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, render_template
 import asyncio
 import pandas as pd
-import numpy as np
 import aiohttp
 from datetime import datetime
-from dotenv import load_dotenv
-import plotly.express as px
-import plotly.io as pio
 import nest_asyncio
+from dotenv import load_dotenv
+import plotly.graph_objs as go
+from plotly.offline import plot
+import logging
 
-load_dotenv()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Apply nest_asyncio to allow nested event loops (useful for certain environments)
 nest_asyncio.apply()
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 
+# Retrieve the Last.fm API key from environment variables
 API_KEY = os.getenv('LASTFM_API_KEY')
 
-<<<<<<< HEAD
-# Check if API Key is loaded properly
+# Ensure the API key is set
 if not API_KEY:
     raise ValueError("LASTFM_API_KEY is not set in environment variables.")
 
-=======
->>>>>>> 2401ab97fecc3046866c842dbecb83be5176c8b5
-async def fetch_page(session, url, params, page):
-    params['page'] = page
-    async with session.get(url, params=params) as response:
-        if response.status == 200:
-            data = await response.json()
-            return data
-        else:
-            print(f"Error fetching page {page}: {response.status}")
-            return None
+# Define the maximum number of pages to fetch to prevent excessive API calls
+MAX_PAGES = 10
 
-<<<<<<< HEAD
-    # Remove None values from params
+async def fetch_page(session, url, params, page):
+    """
+    Fetch a single page of recent tracks from the Last.fm API.
+
+    Args:
+        session (aiohttp.ClientSession): The aiohttp session for making requests.
+        url (str): The API endpoint URL.
+        params (dict): The query parameters for the API request.
+        page (int): The page number to fetch.
+
+    Returns:
+        dict or None: The JSON response from the API if successful, else None.
+    """
+    # Update the page number in the parameters
+    params['page'] = page
+
+    # Remove any parameters with None values to prevent errors
     clean_params = {k: v for k, v in params.items() if v is not None}
 
-    # Debugging: Log the parameters being used
-    print(f"Fetching page {page} with params: {clean_params}")
+    # Log the parameters being used for debugging
+    logger.info(f"Fetching page {page} with params: {clean_params}")
 
     try:
-        async with session.get(url, params=clean_params) as response:
+        async with session.get(url, params=clean_params, timeout=10) as response:
             if response.status == 200:
                 data = await response.json()
                 return data
             elif response.status == 429:
-                # Handle rate limiting
-                retry_after = int(response.headers.get('Retry-After', 1))
-                print(f"Rate limited. Retrying after {retry_after} seconds.")
+                # Handle rate limiting by waiting and retrying
+                retry_after = int(response.headers.get('Retry-After', 5))
+                logger.warning(f"Rate limited. Retrying after {retry_after} seconds.")
                 await asyncio.sleep(retry_after)
                 return await fetch_page(session, url, params, page)
             else:
-                print(f"Error fetching page {page}: {response.status}")
+                logger.error(f"Error fetching page {page}: HTTP {response.status}")
                 return None
     except aiohttp.ClientError as e:
-        print(f"Client error fetching page {page}: {e}")
+        logger.error(f"Client error fetching page {page}: {e}")
         return None
     except asyncio.TimeoutError:
-        print(f"Timeout error fetching page {page}.")
+        logger.error(f"Timeout error fetching page {page}.")
         return None
     except Exception as e:
-        print(f"Unexpected error fetching page {page}: {e}")
+        logger.error(f"Unexpected error fetching page {page}: {e}")
         return None
 
-async def fetch_all_pages(username, max_pages=10):
+async def fetch_all_pages(username, max_pages=MAX_PAGES):
+    """
+    Fetch multiple pages of recent tracks from the Last.fm API.
+
+    Args:
+        username (str): The Last.fm username.
+        max_pages (int): The maximum number of pages to fetch.
+
+    Returns:
+        list: A list of all fetched tracks.
+    """
     url = "https://ws.audioscrobbler.com/2.0/"
-=======
-async def fetch_all_pages(username):
-    url = 'http://ws.audioscrobbler.com/2.0/'
->>>>>>> 2401ab97fecc3046866c842dbecb83be5176c8b5
     params = {
-        'method': 'user.getRecentTracks',
+        'method': 'user.getrecenttracks',
         'user': username,
         'api_key': API_KEY,
         'format': 'json',
-<<<<<<< HEAD
-        'limit': 200
-=======
-        'limit': 200,
->>>>>>> 2401ab97fecc3046866c842dbecb83be5176c8b5
+        'limit': 200  # Maximum number of tracks per page
     }
 
     all_tracks = []
     async with aiohttp.ClientSession() as session:
+        # Fetch the first page to determine total pages
         first_page_data = await fetch_page(session, url, params, 1)
-        if not first_page_data or 'recenttracks' not in first_page_data or 'track' not in first_page_data['recenttracks']:
+        if not first_page_data:
             return []
-        
-        total_pages = int(first_page_data['recenttracks']['@attr']['totalPages'])
-        print(f"Total pages: {total_pages}")
 
-<<<<<<< HEAD
-        total_pages = int(first_page_data.get('recenttracks', {}).get('@attr', {}).get('totalPages', 1))
-        # Limit the total_pages to max_pages
+        # Extract total number of pages from the response
+        try:
+            recent_tracks = first_page_data['recenttracks']
+            attr = recent_tracks.get('@attr', {})
+            total_pages = int(attr.get('totalPages', 1))
+        except (KeyError, ValueError) as e:
+            logger.error(f"Error parsing total pages: {e}")
+            return []
+
+        # Limit the total pages to max_pages to prevent excessive fetching
         total_pages = min(total_pages, max_pages)
-        all_tracks = first_page_data.get('recenttracks', {}).get('track', [])
+        logger.info(f"Total pages to fetch: {total_pages}")
 
+        # Extract tracks from the first page
+        tracks = recent_tracks.get('track', [])
+        all_tracks.extend(tracks)
+
+        # Sequentially fetch remaining pages
         for page in range(2, total_pages + 1):
             page_data = await fetch_page(session, url, params, page)
             if page_data:
@@ -105,93 +130,123 @@ async def fetch_all_pages(username):
                 if tracks:
                     all_tracks.extend(tracks)
                 else:
-                    # No more tracks
+                    # No more tracks available
+                    logger.info(f"No tracks found on page {page}. Stopping fetch.")
                     break
             else:
                 # If fetching a page fails, stop fetching further pages
+                logger.error(f"Failed to fetch page {page}. Stopping fetch.")
                 break
             # Optional: Add a short delay to respect API rate limits
             await asyncio.sleep(0.2)  # 200ms delay
 
     return all_tracks
-=======
-        all_tracks.extend(first_page_data['recenttracks']['track'])
-        for page in range(2, total_pages + 1):
-            data = await fetch_page(session, url, params, page)
-            if data and 'recenttracks' in data and 'track' in data['recenttracks']:
-                all_tracks.extend(data['recenttracks']['track'])
 
-            # Avoid fetching too many pages at once
-            if page % 10 == 0:
-                await asyncio.sleep(1)
+def process_scrobble_data(all_tracks):
+    """
+    Process the fetched tracks to calculate daily listening counts.
 
-    return all_tracks
+    Args:
+        all_tracks (list): A list of track dictionaries fetched from the API.
 
-def process_scrobble_data(tracks):
-    df = pd.DataFrame(tracks)
-    if df.empty:
-        return pd.DataFrame()
+    Returns:
+        pandas.DataFrame: A DataFrame with dates and corresponding track counts.
+    """
+    scrobbles = []
+    for track in all_tracks:
+        # Skip currently playing tracks
+        if '@attr' in track and track['@attr'].get('nowplaying') == 'true':
+            continue
+        scrobble_time = track.get('date', {}).get('uts')
+        if scrobble_time:
+            scrobbles.append(datetime.fromtimestamp(int(scrobble_time)))
 
-    def extract_date(x):
-        if isinstance(x, dict):
-            return x.get('#text', None)
-        return None
+    if not scrobbles:
+        return pd.DataFrame(columns=['date', 'count'])
 
-    df['date'] = pd.to_datetime(df['date'].apply(extract_date), format='%d %b %Y, %H:%M')
-    df['Day'] = df['date'].dt.date
-    daily_counts = df.groupby('Day').size().reset_index(name='Counts')
+    # Create a DataFrame for daily counts
+    df = pd.DataFrame(scrobbles, columns=['datetime'])
+    df['date'] = df['datetime'].dt.date
+    daily_counts = df.groupby('date').size().reset_index(name='count')
+
     return daily_counts
 
-def create_heatmap(daily_counts, color_palette='rocket'):
-    daily_counts['Day'] = pd.to_datetime(daily_counts['Day'])
-    daily_counts['DayOfMonth'] = daily_counts['Day'].dt.day
-    daily_counts['Month'] = daily_counts['Day'].dt.to_period('M')
+def create_heatmap(daily_counts, palette):
+    """
+    Create a heatmap using Plotly based on daily listening counts.
 
-    # Pivot table to create a grid
-    pivot_table = daily_counts.pivot_table(values='Counts', index='DayOfMonth', columns='Month', fill_value=0)
+    Args:
+        daily_counts (pandas.DataFrame): DataFrame with dates and track counts.
+        palette (str): The color palette for the heatmap.
 
-    # Set the max days dynamically based on the month
-    for day in range(29, 32):
-        for month in pivot_table.columns:
-            if day > month.days_in_month:
-                pivot_table.at[day, month] = np.nan  # Gray-out days that do not exist
+    Returns:
+        str: The HTML div string for the Plotly heatmap.
+    """
+    if daily_counts.empty:
+        return "<p>No data available to display the heatmap.</p>"
 
-    # Convert month periods to timestamps for proper visualization in Plotly
-    pivot_table.columns = pivot_table.columns.to_timestamp()
+    # Create a continuous color scale based on the selected palette
+    colorscale = palette
 
-    # Create interactive heatmap using Plotly
-    fig = px.imshow(
-        pivot_table,
-        color_continuous_scale=color_palette,
-        labels={'x': 'Month', 'y': 'Day of Month', 'color': 'Number of Songs Played'},
-        aspect='auto'
+    # Create the heatmap figure
+    fig = go.Figure(data=go.Heatmap(
+        z=daily_counts['count'],
+        x=daily_counts['date'],
+        y=[''] * len(daily_counts),  # Single row for dates
+        colorscale=colorscale,
+        showscale=True
+    ))
+
+    # Update the layout for better visualization
+    fig.update_layout(
+        title='Daily Music Listening Heatmap',
+        xaxis_title='Date',
+        yaxis_visible=False,
+        height=400
     )
 
-    # Adjust the hover information
-    fig.update_traces(
-        hovertemplate="Month: %{x}<br>Day: %{y}<br>Songs: %{z}<extra></extra>"
-    )
-
-    # Gray-out non-existing days
-    fig.update_xaxes(tickangle=45)
-    fig.update_layout(title='Heatmap of Songs Listened to Per Day')
-
-    # Save the figure as an HTML file
-    pio.write_html(fig, 'static/heatmap.html')
-    return 'static/heatmap.html'
+    # Generate the HTML div string for embedding in the template
+    return plot(fig, output_type='div')
 
 @app.route('/', methods=['GET', 'POST'])
 async def index():
-    filename = None
-    if request.method == 'POST':
-        username = request.form['username']
-        color_palette = request.form.get('color_palette', 'rocket')  # Default to 'rocket'
+    """
+    The main route for the application. Handles both GET and POST requests.
 
-        all_tracks = await fetch_all_pages(username)
-        daily_counts = process_scrobble_data(all_tracks)
-        filename = create_heatmap(daily_counts, color_palette)
-    return render_template('index.html', filename=filename)
+    GET: Renders the main page with the input form.
+    POST: Processes the submitted username, fetches data, generates the heatmap, and renders the result.
+    """
+    plot_div = None
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username')
+        palette = request.form.get('palette', 'Viridis')  # Default palette is 'Viridis'
+
+        if not username:
+            error = "Username is required."
+            return render_template('index.html', plot_div=plot_div, error=error)
+
+        try:
+            # Fetch recent tracks with a limit on the number of pages
+            all_tracks = await fetch_all_pages(username, max_pages=MAX_PAGES)
+            if not all_tracks:
+                error = "No tracks found or API error."
+                return render_template('index.html', plot_div=plot_div, error=error)
+
+            # Process the fetched data to get daily counts
+            daily_counts = process_scrobble_data(all_tracks)
+            if daily_counts.empty:
+                error = "No scrobbles available to generate a heatmap."
+                return render_template('index.html', plot_div=plot_div, error=error)
+
+            # Create the heatmap HTML div
+            plot_div = create_heatmap(daily_counts, palette)
+        except Exception as e:
+            error = f"An unexpected error occurred: {e}"
+            logger.error(f"Error in index route: {e}")
+
+    return render_template('index.html', plot_div=plot_div, error=error)
 
 if __name__ == '__main__':
-    app.run()
->>>>>>> 2401ab97fecc3046866c842dbecb83be5176c8b5
+    # Run the Flask app in debug mode for local development
+    app.run(debug=True)
