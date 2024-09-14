@@ -35,14 +35,26 @@ async def fetch_page(session, url, params, page):
             if response.status == 200:
                 data = await response.json()
                 return data
+            elif response.status == 429:
+                # Handle rate limiting
+                retry_after = int(response.headers.get('Retry-After', 1))
+                print(f"Rate limited. Retrying after {retry_after} seconds.")
+                await asyncio.sleep(retry_after)
+                return await fetch_page(session, url, params, page)
             else:
                 print(f"Error fetching page {page}: {response.status}")
                 return None
+    except aiohttp.ClientError as e:
+        print(f"Client error fetching page {page}: {e}")
+        return None
+    except asyncio.TimeoutError:
+        print(f"Timeout error fetching page {page}.")
+        return None
     except Exception as e:
-        print(f"Exception during fetch_page: {e}")
+        print(f"Unexpected error fetching page {page}: {e}")
         return None
 
-async def fetch_all_pages(username):
+async def fetch_all_pages(username, max_pages=10):
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
         'method': 'user.getrecenttracks',
@@ -52,51 +64,30 @@ async def fetch_all_pages(username):
         'limit': 200
     }
 
+    all_tracks = []
     async with aiohttp.ClientSession() as session:
         first_page_data = await fetch_page(session, url, params, 1)
         if not first_page_data:
             return []
 
         total_pages = int(first_page_data.get('recenttracks', {}).get('@attr', {}).get('totalPages', 1))
+        # Limit the total_pages to max_pages
+        total_pages = min(total_pages, max_pages)
         all_tracks = first_page_data.get('recenttracks', {}).get('track', [])
 
-        tasks = [
-            fetch_page(session, url, params, page)
-            for page in range(2, total_pages + 1)
-        ]
-
-        pages = await asyncio.gather(*tasks)
-        for page_data in pages:
+        for page in range(2, total_pages + 1):
+            page_data = await fetch_page(session, url, params, page)
             if page_data:
-                all_tracks.extend(page_data.get('recenttracks', {}).get('track', []))
+                tracks = page_data.get('recenttracks', {}).get('track', [])
+                if tracks:
+                    all_tracks.extend(tracks)
+                else:
+                    # No more tracks
+                    break
+            else:
+                # If fetching a page fails, stop fetching further pages
+                break
+            # Optional: Add a short delay to respect API rate limits
+            await asyncio.sleep(0.2)  # 200ms delay
 
-        return all_tracks
-
-def process_scrobble_data(all_tracks):
-    # Your data processing logic here
-    pass
-
-def create_heatmap(daily_counts, palette):
-    # Your heatmap creation logic here
-    pass
-
-@app.route('/', methods=['GET', 'POST'])
-async def index():
-    plot_div = None
-    if request.method == 'POST':
-        username = request.form.get('username')
-        palette = request.form.get('palette', 'Viridis')
-
-        if not username:
-            return render_template('index.html', plot_div=plot_div, error="Username is required.")
-
-        all_tracks = await fetch_all_pages(username)
-        if not all_tracks:
-            return render_template('index.html', plot_div=plot_div, error="No tracks found or API error.")
-
-        daily_counts = process_scrobble_data(all_tracks)
-        plot_div = create_heatmap(daily_counts, palette)
-    return render_template('index.html', plot_div=plot_div)
-
-if __name__ == '__main__':
-    app.run(debug=True)
+    return all_tracks
